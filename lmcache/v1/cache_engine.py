@@ -61,6 +61,7 @@ from lmcache.v1.token_database import (
     SegmentTokenDatabase,
     TokenDatabase,
 )
+from lmcache.v1.tokendance.segment_index import RoundAwareSegmentDatabase
 
 logger = init_logger(__name__)
 
@@ -1926,6 +1927,10 @@ class LMCacheEngineBuilder:
         config: LMCacheEngineConfig,
         metadata: LMCacheMetadata,
     ) -> TokenDatabase:
+        # TokenDance round-aware segment indexing takes priority when enabled
+        if config.get_extra_config_value("enable_tokendance", False):
+            logger.info("Using RoundAwareSegmentDatabase (TokenDance)")
+            return RoundAwareSegmentDatabase(config, metadata)
         if config.enable_blending:
             return SegmentTokenDatabase(config, metadata)
         return ChunkedTokenDatabase(config, metadata)
