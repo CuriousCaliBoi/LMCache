@@ -22,6 +22,7 @@ from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.request import RequestStatus
 from vllm.version import __version__ as VLLM_VERSION
 import torch
+from torch import nn
 
 # First Party
 # Use LMCache's own math utilities instead of vllm's
@@ -522,17 +523,14 @@ class LMCacheConnectorV1Impl:
             self.use_layerwise = config.use_layerwise
             self.enable_blending = config.enable_blending
 
-            if self.enable_blending:
-                assert self.lmcache_engine is not None
-                assert self.lmcache_engine.gpu_connector is not None, (
-                    "GPU connector must be available for blending"
-                )
-                self.blender = LMCBlenderBuilder.get_or_create(
-                    ENGINE_NAME,
-                    self.lmcache_engine,
-                    self.lmcache_engine.gpu_connector,
-                    config,
-                )
+            # NOTE(tokendance): Blender creation is deferred to
+            # _ensure_blender_initialized(), which is called lazily from
+            # start_load_kv() after the vLLM model has been loaded and
+            # registered via register_kv_caches().  This removes the need
+            # for a sitecustomize.py hook to call
+            # VLLMModelTracker.register_model() before the connector init.
+            self.blender = None
+            self._blender_init_attempted = False
 
         # Legacy compatibility check
         self._check_legacy_register_kv_caches()
@@ -586,6 +584,66 @@ class LMCacheConnectorV1Impl:
                 "features may not work, such as DSA"
             )
             self._manager.post_init()
+
+    def _register_vllm_model_for_blending(self) -> None:
+        """Extract and register the vLLM model for the blending pipeline.
+
+        Called from :meth:`register_kv_caches` once KV cache tensors are
+        available.  The method walks the ``forward_context`` or the parent
+        connector to locate the loaded ``nn.Module`` and registers it via
+        ``VLLMModelTracker.register_model()``.
+
+        This is the **proper hook point** that replaces any
+        ``sitecustomize.py`` monkey-patch.  The model is guaranteed to be
+        fully loaded at this stage because ``register_kv_caches`` is only
+        called after weight loading completes.
+        """
+        try:
+            # First Party
+            from lmcache.v1.compute.models.utils import VLLMModelTracker
+
+            # The model lives on the parent connector's worker.  In vLLM V1
+            # the worker exposes it through get_pp_group or the model_runner.
+            # Try the standard vLLM path first.
+            model = None
+
+            # Path 1: vLLM ≥ 0.12 — model_runner on the worker
+            try:
+                pp_group = get_pp_group()
+                if hasattr(pp_group, "model_runner") and hasattr(
+                    pp_group.model_runner, "model"
+                ):
+                    model = pp_group.model_runner.model
+            except Exception:
+                pass
+
+            # Path 2: walk the parent connector for a .model attribute
+            if model is None:
+                for attr_name in ("model", "_model", "model_runner"):
+                    candidate = getattr(self._parent, attr_name, None)
+                    if candidate is not None and isinstance(candidate, nn.Module):
+                        model = candidate
+                        break
+                    if candidate is not None and hasattr(candidate, "model"):
+                        model = candidate.model
+                        break
+
+            if model is not None:
+                VLLMModelTracker.register_model(ENGINE_NAME, model)
+                logger.info(
+                    "Registered vLLM model '%s' for blending via "
+                    "register_kv_caches hook",
+                    type(model).__name__,
+                )
+            else:
+                logger.warning(
+                    "Could not locate vLLM model for blending registration. "
+                    "Blending will be attempted lazily on first request."
+                )
+        except Exception as exc:
+            logger.warning(
+                "Failed to register vLLM model for blending: %s", exc
+            )
 
     # ==================== Property Accessors ====================
 
@@ -727,6 +785,47 @@ class LMCacheConnectorV1Impl:
     ####################
     # Worker side APIs
     ####################
+    def _ensure_blender_initialized(self) -> None:
+        """Lazily create the blender on first use.
+
+        The blender requires a registered vLLM model
+        (``VLLMModelTracker.get_model``).  The model is registered in
+        :meth:`register_kv_caches` (after vLLM finishes loading weights),
+        so the blender cannot be created during ``__init__``.
+
+        This method is called from :meth:`start_load_kv` on the first
+        request that needs blending.  It replaces the old pattern of
+        creating the blender in ``_init_connector_state`` and removes
+        the need for a ``sitecustomize.py`` hook.
+        """
+        if self.blender is not None or self._blender_init_attempted:
+            return
+        self._blender_init_attempted = True
+
+        if not self.enable_blending:
+            return
+
+        assert self.lmcache_engine is not None
+        assert self.lmcache_engine.gpu_connector is not None, (
+            "GPU connector must be available for blending"
+        )
+
+        try:
+            self.blender = LMCBlenderBuilder.get_or_create(
+                ENGINE_NAME,
+                self.lmcache_engine,
+                self.lmcache_engine.gpu_connector,
+                self.config,
+            )
+            logger.info("Blender initialized successfully (deferred init)")
+        except (ValueError, KeyError) as exc:
+            logger.warning(
+                "Failed to initialize blender: %s. "
+                "Blending will be unavailable for this session.",
+                exc,
+            )
+            self.enable_blending = False
+
     @_lmcache_nvtx_annotate
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         logger.info("Registering KV caches")
@@ -735,6 +834,14 @@ class LMCacheConnectorV1Impl:
         assert len(self.kv_caches) == 0 and len(kv_caches) > 0
         self.kv_caches = kv_caches
         self._build_kv_layer_groups()
+
+        # Register the vLLM model for blending.  At this point the model
+        # weights are loaded and the kv_caches dict contains layer names
+        # that let us find the parent model on the vLLM side.  This is
+        # the proper replacement for the sitecustomize.py hook.
+        if self.enable_blending:
+            self._register_vllm_model_for_blending()
+
         self._manager.post_init()
 
     @_lmcache_nvtx_annotate
@@ -751,6 +858,10 @@ class LMCacheConnectorV1Impl:
             the same.
         """
         self.current_layer = 0
+
+        # Lazy blender init: first call after model is loaded
+        if self.enable_blending and self.blender is None:
+            self._ensure_blender_initialized()
 
         if len(self.kv_caches) == 0:
             logger.warning(
